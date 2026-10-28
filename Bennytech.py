@@ -1,0 +1,348 @@
+import os
+import secrets
+import sqlite3
+from datetime import datetime
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask import (
+    Flask, request, redirect, url_for, session, flash,
+    render_template_string, abort
+)
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(APP_DIR, "nkumbi_class_portal.db")
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("NKUMBI_SECRET_KEY") or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=5 * 1024 * 1024,
+)
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+def init_db():
+    with get_db() as db:
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL,
+            student_number TEXT UNIQUE,
+            email TEXT NOT NULL UNIQUE,
+            programme TEXT NOT NULL DEFAULT '',
+            department TEXT NOT NULL DEFAULT '',
+            year_of_study TEXT NOT NULL DEFAULT '',
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'student',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL
+        );
+        """)
+        
+        user_cols = {r["name"] for r in db.execute("PRAGMA table_info(users)").fetchall()}
+        for name, definition in [
+            ("department", "TEXT NOT NULL DEFAULT ''"),
+            ("year_of_study", "TEXT NOT NULL DEFAULT ''"),
+            ("role", "TEXT NOT NULL DEFAULT 'student'"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            if name not in user_cols:
+                db.execute(f"ALTER TABLE users ADD COLUMN {name} {definition}")
+
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+init_db()
+
+def admin_exists():
+    with get_db() as db:
+        return db.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1").fetchone() is not None
+
+# Custom Permanent Setup Key
+SETUP_KEY = "bennytechsolution"
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
+            flash("Please log in first.", "warning")
+            return redirect(url_for("login"))
+        return view(*args, **kwargs)
+    return wrapped
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
+            flash("Please log in first.", "warning")
+            return redirect(url_for("login"))
+        if session.get("role") != "admin":
+            abort(403)
+        return view(*args, **kwargs)
+    return wrapped
+
+def current_user():
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    with get_db() as db:
+        return db.execute(
+            "SELECT id, full_name, student_number, email, programme, department, year_of_study, role, created_at "
+            "FROM users WHERE id=?", (user_id,)
+        ).fetchone()
+
+BASE = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} | Nkumbi Class Portal</title>
+<style>
+:root{--navy:#123b72;--blue:#2164c5;--sky:#eaf3ff;--gold:#ffbf47;--ink:#182230;--muted:#637083;--white:#fff;--line:#e1e7f0;--red:#a92727}
+*{box-sizing:border-box}
+body{
+    margin:0;
+    font-family:system-ui,-apple-system,sans-serif;
+    background: linear-gradient(270deg, #0f2027, #203a43, #2c5364, #123b72, #2164c5);
+    background-size: 600% 600%;
+    animation: techBackground 18s ease infinite;
+    color: var(--ink);
+    line-height: 1.5;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+@keyframes techBackground {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+}
+a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}
+header{background:rgba(16, 47, 94, 0.92); backdrop-filter: blur(10px); color:#fff;padding:15px 0; border-bottom: 1px solid rgba(255,255,255,0.1)}
+.nav{max-width:1100px;margin:auto;padding:0 16px;display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.brand{font-weight:850;font-size:1.1rem;color:#fff}.brand small{display:block;font-size:.72rem;font-weight:500;opacity:.82}
+.navlinks{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.navlinks a{color:#fff;font-size:.92rem}
+main{max-width:1100px;width:100%;margin:24px auto;padding:0 16px 40px;flex:1}
+.card{background:rgba(255, 255, 255, 0.95); backdrop-filter: blur(12px); border:1px solid var(--line);border-radius:17px;padding:19px;box-shadow:0 8px 32px rgba(0,0,0,0.15);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:11px;padding:11px 16px;background:var(--blue);color:#fff;font-weight:700;cursor:pointer;text-decoration:none}
+.btn.gold{background:var(--gold);color:#28200d}
+label{display:block;font-size:.9rem;font-weight:700;margin:10px 0 5px}input,textarea{width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:10px;background:white;font:inherit}
+.flash{padding:12px 14px;border-radius:10px;margin:0 0 12px;background:#eaf3ff;border:1px solid #c9ddff}
+.flash.success{background:#e9f8ef;border-color:#b9e8ca}.flash.error{background:#ffeded;border-color:#f2bcbc}
+.form-card{max-width:700px;margin:0 auto}
+footer{text-align:center;padding:22px;color:#fff;font-size:.85rem;background:rgba(0,0,0,0.2); margin-top: auto;}
+</style>
+</head>
+<body>
+<header><div class="nav">
+<a class="brand" href="{{ url_for('home') }}">🎓 NKUMBI CLASS PORTAL<small>Powered by Benny Tech Solution</small></a>
+<nav class="navlinks">
+{% if session.get('user_id') %}
+<a href="{{ url_for('dashboard') }}">Dashboard</a>
+{% if session.get('role') == 'admin' %}<a href="{{ url_for('admin_dashboard') }}">Administration</a>{% endif %}
+<a href="{{ url_for('logout') }}">Log out</a>
+{% else %}
+<a href="{{ url_for('login') }}">Log in</a><a href="{{ url_for('register') }}">Register</a>
+{% endif %}
+</nav></div></header>
+<main>
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}
+{% endwith %}
+{{ body|safe }}
+</main>
+<footer>Nkumbi Class Portal &copy; 2026 · Benny Tech Solution</footer>
+</body></html>
+"""
+
+def page(title, body, **context):
+    body_html = render_template_string(body, **context)
+    return render_template_string(BASE, title=title, body=body_html)
+
+@app.route("/")
+def home():
+    body = """
+    <div class="card" style="background:linear-gradient(125deg,#153b75,#2c78d7);color:white;padding:28px;">
+      <h1>Welcome to Nkumbi Class Portal</h1>
+      <p>Collaborative academic management and announcements for staff and students.</p>
+      {% if not session.get('user_id') %}
+        <a class="btn gold" href="{{ url_for('login') }}">Log in</a>
+        <a class="btn" style="background:#fff;color:#123b72;" href="{{ url_for('register') }}">Register</a>
+      {% endif %}
+    </div>
+    """
+    return page("Welcome", body)
+
+@app.route("/setup", methods=["GET", "POST"])
+def setup_admin():
+    if admin_exists():
+        return page("Setup complete", '<div class="card"><h2>Administrator already set up</h2><p><a class="btn" href="' + url_for('login') + '">Go to login</a></p></div>')
+    
+    if request.method == "POST":
+        key = request.form.get("setup_key", "")
+        name = request.form.get("full_name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        
+        if not secrets.compare_digest(key, SETUP_KEY):
+            flash("Incorrect setup key. Use: bennytechsolution", "error")
+        elif not name or not email or len(password) < 10:
+            flash("Provide a name, valid email, and a password of at least 10 characters.", "error")
+        else:
+            try:
+                with get_db() as db:
+                    db.execute("INSERT INTO users(full_name, email, password_hash, role, created_at) VALUES(?, ?, ?, 'admin', ?)",
+                               (name, email, generate_password_hash(password), now_text()))
+                flash("Administrator account created successfully! Please log in.", "success")
+                return redirect(url_for("login"))
+            except sqlite3.IntegrityError:
+                flash("That email address is already in use.", "error")
+                
+    body = f"""
+    <div class="card form-card">
+      <h1>First-time administrator setup</h1>
+      <div style="background:#eaf3ff; border:1px solid #2164c5; padding:12px; border-radius:10px; margin-bottom:15px;">
+        <strong>Your Permanent Setup Key:</strong> <code style="background:#fff; padding:3px 6px; font-weight:bold; color:#123b72;">{SETUP_KEY}</code>
+      </div>
+      <form method="post">
+        <label>Setup Key</label><input name="setup_key" required autocomplete="off" placeholder="Enter key here">
+        <label>Full Name</label><input name="full_name" required>
+        <label>Email Address</label><input type="email" name="email" required>
+        <label>Password (at least 10 characters)</label><input type="password" name="password" required minlength="10">
+        <button class="btn" type="submit" style="margin-top:14px;">Create administrator</button>
+      </form>
+    </div>
+    """
+    return page("Administrator Setup", body)
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if session.get("user_id"):
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        name = request.form.get("full_name", "").strip()
+        student_no = request.form.get("student_number", "").strip().upper()
+        email = request.form.get("email", "").strip().lower()
+        programme = request.form.get("programme", "").strip()
+        password = request.form.get("password", "")
+        if not all([name, student_no, email, programme, password]):
+            flash("Please complete all required fields.", "error")
+        else:
+            try:
+                with get_db() as db:
+                    db.execute("INSERT INTO users(full_name, student_number, email, programme, password_hash, role, created_at) VALUES(?,?,?,?,?,'student',?)",
+                               (name, student_no, email, programme, generate_password_hash(password), now_text()))
+                flash("Registration successful! Please log in.", "success")
+                return redirect(url_for("login"))
+            except sqlite3.IntegrityError:
+                flash("Student number or email already registered.", "error")
+    body = """
+    <div class="card form-card">
+      <h1>Student Registration</h1>
+      <form method="post">
+        <label>Full Name</label><input name="full_name" required>
+        <label>Student Number</label><input name="student_number" required>
+        <label>Email Address</label><input type="email" name="email" required>
+        <label>Programme</label><input name="programme" required>
+        <label>Password</label><input type="password" name="password" required>
+        <button class="btn" type="submit" style="margin-top:14px;">Register</button>
+      </form>
+    </div>
+    """
+    return page("Register", body)
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("user_id"):
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        with get_db() as db:
+            user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        if user and check_password_hash(user["password_hash"], password):
+            session["user_id"] = user["id"]
+            session["role"] = user["role"]
+            flash(f"Welcome back, {user['full_name']}!", "success")
+            return redirect(url_for("admin_dashboard" if user["role"] == "admin" else "dashboard"))
+        flash("Invalid email or password.", "error")
+    body = """
+    <div class="card form-card">
+      <h1>Log in</h1>
+      <form method="post">
+        <label>Email Address</label><input type="email" name="email" required>
+        <label>Password</label><input type="password" name="password" required>
+        <button class="btn" type="submit" style="margin-top:14px;">Log In</button>
+      </form>
+    </div>
+    """
+    return page("Login", body)
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    user = current_user()
+    if user["role"] == "admin":
+        return redirect(url_for("admin_dashboard"))
+    body = f"""
+    <div class="card">
+      <h1>Student Dashboard</h1>
+      <p>Welcome, {user['full_name']}!</p>
+    </div>
+    """
+    return page("Dashboard", body)
+
+@app.route("/admin", methods=["GET", "POST"])
+@admin_required
+def admin_dashboard():
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        body_text = request.form.get("body", "").strip()
+        if title and body_text:
+            with get_db() as db:
+                db.execute("INSERT INTO announcements(title, body, created_by, created_at) VALUES(?, ?, ?, ?)",
+                           (title, body_text, session.get("user_id"), now_text()))
+            flash("Announcement posted successfully!", "success")
+        return redirect(url_for("admin_dashboard"))
+    
+    with get_db() as db:
+        announcements = db.execute("SELECT * FROM announcements ORDER BY id DESC").fetchall()
+    
+    body = """
+    <div class="card">
+      <h1>Administration Dashboard</h1>
+      <p>Post official college announcements below.</p>
+    </div>
+    <div class="card form-card">
+      <h2>Post New Announcement</h2>
+      <form method="post">
+        <label>Title</label><input name="title" required>
+        <label>Announcement Body</label><textarea name="body" required style="min-height:100px;"></textarea>
+        <button class="btn" type="submit" style="margin-top:14px;">Publish Announcement</button>
+      </form>
+    </div>
+    """
+    return page("Administration", body)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("You have been logged out.", "success")
+    return redirect(url_for("home"))
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
